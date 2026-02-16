@@ -1002,13 +1002,13 @@ if __name__ == '__main__':
                min_s=min_s,max_s=max_s)                       
     
  
-plot_debt_frontier_labeled(
-    res,
-    label_pos="start",
-    cost_col="return",
-    cost_s=fx_yield,
-    cov_df=cov_df,
-    export_path="zar_debt_frontier",
-    export_formats=("png", "pdf", "svg")
-)
+    plot_debt_frontier_labeled(
+        res,
+        label_pos="start",
+        cost_col="return",
+        cost_s=fx_yield,
+        cov_df=cov_df,
+        export_path="zar_debt_frontier",
+        export_formats=("png", "pdf", "svg")
+    )
 
