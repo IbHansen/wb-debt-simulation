@@ -952,7 +952,7 @@ if __name__ == '__main__':
         freq='Q'
     )
     
-    # Step 2: express everything in USD
+    # Step 2: express everything in base currency 
     fx_ccy = convert_base_currency(fx_eur, base="zar")
     
     fx_returns = get_fx_returns(fx_ccy)
