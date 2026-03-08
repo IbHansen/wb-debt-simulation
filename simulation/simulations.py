@@ -79,15 +79,3 @@ def ui_simulations():
     
     return updatewidget(mport,wscenario)
 
-
-# In[ ]:
-
-
-
-
-
-# In[ ]:
-
-
-
-
