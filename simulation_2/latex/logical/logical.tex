@@ -1,0 +1,45 @@
+\documentclass{article}
+\usepackage{booktabs}
+\usepackage{caption} % Include the caption package
+\captionsetup{justification=raggedright,singlelinecheck=false}
+\usepackage{graphicx}
+\usepackage{pgf}
+\usepackage{lscape}
+\usepackage{amsmath,amssymb}
+\usepackage{placeins} % for \FloatBarrier
+
+
+\begin{document}
+
+\section{List definitions}
+
+
+\par\noindent
+\verb|> list issued = issued        : issued_2025 * issued_2037 /|\\
+\verb|>>              issued_year   :        2025 *        2037|\\
+\par
+
+\par\noindent
+\verb|>list bond = bond :     1_year_dom 5_year_dom 10_year_dom  1_year_usd 5_year_usd 10_year_usd /|\\
+\verb|>>        maturity :             1           5          10           1          5          10 /|\\
+\verb|>>        grace    :              0          3          6           0         4            9    /|\\
+\verb|>>        currency :            dom        dom         dom         usd        usd         usd /|\\
+\verb|>>         domestic :             1          1           1           0          0           0 /|\\
+\verb|>>         foreign :              0          0           0           1          1           1|\\
+\par
+
+\subsection{Define logical variables}
+The folowing variables are defined for each bond and each issuing year. They are **logical variables** that is they can be either 0.0 or 1.0.
+
+The terms enclosed in `{}` are taken from the relevant sublists. the  `current_year` are taken from the input dataset.
+
+\par\noindent
+\verb|> doable logical_issuing__bond = current_year == {issued_year}|\\
+\verb|> doable logical_maturing__bond =  current_year == {issued_year}+{maturity}|\\
+\verb|> doable logical_amortizing__bond =  ( {issued_year}+{grace}) < current_year <= ({issued_year} + {maturity})|\\
+\verb|> doable logical_paying_years__bond =  {issued_year} < current_year <= ({issued_year} + {maturity})|\\
+\verb|> doable amortizing_time__bond =  {maturity}-{grace}|\\
+\verb|> doable amortizing_share_pr_time__bond =  logical_amortizing__bond * 1./amortizing_time__bond|\\
+\par
+\end{document}
+        
