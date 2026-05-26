@@ -143,6 +143,7 @@ def add_bullets_separate(slide, left_in, top_in, width_in, items, *,
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "mean_variance_optimization.pptx"
 FRONTIER_IMG = HERE / "zar_debt_frontier.png"
+FRONTIER_DOM_IMG = HERE / "zar_debt_frontier_with_domestic.png"
 
 NAVY = RGBColor(0x0B, 0x2E, 0x4F)
 ACCENT = RGBColor(0xC8, 0x4B, 0x31)
@@ -405,7 +406,33 @@ else:
              "[zar_debt_frontier.png not found — run python exchangerates_get.py]",
              size=18, color=ACCENT, align="center")
 
-# --- Slide 8: Reading the frontier -------------------------------------
+# --- Slide 8: Adding domestic debt -------------------------------------
+s = add_slide()
+add_title_bar(s, "Adding domestic debt to the choice set",
+              "A ZAR-denominated option:  zero FX risk, 5% interest rate (placeholder)")
+if FRONTIER_DOM_IMG.exists():
+    s.shapes.add_picture(str(FRONTIER_DOM_IMG), Inches(0.4), Inches(1.2),
+                         height=Inches(5.0))
+else:
+    add_text(s, Inches(0.4), Inches(3.5), Inches(7.5), Inches(0.5),
+             "[zar_debt_frontier_with_domestic.png not found]",
+             size=14, color=ACCENT, align="center")
+# right-hand explainer
+add_text(s, Inches(8.6), Inches(1.3), Inches(4.5), Inches(0.5),
+         "What changes", size=20, bold=True, color=NAVY)
+add_bullets(s, Inches(8.6), Inches(1.8), Inches(4.5), Inches(5.0), [
+    "Extend cov_df with a ZAR row/column of zeros — domestic debt has no FX variance.",
+    "Add a ZAR row to assumptions:  interest_rate = 5%,  current_share = 0.",
+    "The QP now picks among 6 instruments — 5 foreign + 1 domestic.",
+    "Min-variance corner shifts to ~100% ZAR (riskless, but expensive).",
+    "Min-cost corner is still the cheapest foreign currency, with FX risk.",
+    "The widget auto-renders the extra ZAR row — no UI changes needed.",
+], size=13)
+add_text(s, Inches(0.4), Inches(6.4), Inches(12), Inches(0.3),
+         "Source: optimization/zar_debt_frontier_with_domestic.png  —  generated from the notebook’s additional-frontier cell",
+         size=11, color=GREY)
+
+# --- Slide 9: Reading the frontier -------------------------------------
 s = add_slide()
 add_title_bar(s, "Reading the three panels",
               "What the plotter shows you")
