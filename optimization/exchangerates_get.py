@@ -7,20 +7,25 @@
 
 
 import pandas as pd
-import numpy as np 
+import numpy as np
 import requests
+from dataclasses import dataclass, field
 from io import StringIO
-from cvxopt         import matrix,  spdiag
-
-
-
-import pandas as pd
-import requests
-from io import StringIO
-
+from pathlib import Path
+from typing import Callable, Optional
+from cvxopt import matrix, spdiag
 
 
 from model_cvx import mv_opt
+
+
+_CACHE_DIR = Path(__file__).parent / "currency"
+
+
+def _ecb_cache_path(currencies, start, end, freq, agg):
+    key = "_".join(sorted(c.upper() for c in currencies))
+    name = f"ecb_{key}__{start}__{end or 'open'}__{freq}__{agg}.pkl"
+    return _CACHE_DIR / name
 
 
 def ecb_fx_eur(
@@ -28,10 +33,16 @@ def ecb_fx_eur(
     start="2000-01-01",
     end=None,
     freq="Y",          # 'D', 'M', 'Q', 'A'
-    agg="last"         # 'mean', 'last', 'first'
+    agg="last",        # 'mean', 'last', 'first'
+    refresh=False,
 ):
     """
     Download ECB FX rates and return data at user-chosen frequency.
+
+    Results are cached on disk in `optimization/currency/`, keyed by the
+    request parameters. With `refresh=False` (default) a cached file is
+    returned if present; otherwise the data is fetched from the ECB and
+    written to cache. With `refresh=True` the cache is always overwritten.
 
     Parameters
     ----------
@@ -43,6 +54,8 @@ def ecb_fx_eur(
         Output frequency: 'D', 'M', 'QE', 'A'
     agg : str
         Aggregation: 'mean', 'last', 'first'
+    refresh : bool
+        If True, bypass the on-disk cache and re-download from the ECB.
 
     Returns
     -------
@@ -50,7 +63,12 @@ def ecb_fx_eur(
         FX rates with PeriodIndex(freq)
     """
 
-    currency_str = "+".join(currencies).upper() 
+    cache = _ecb_cache_path(currencies, start, end, freq, agg)
+
+    if not refresh and cache.exists():
+        return pd.read_pickle(cache)
+
+    currency_str = "+".join(currencies).upper()
 
     url = (
         "https://data-api.ecb.europa.eu/service/data/EXR/"
@@ -98,8 +116,11 @@ def ecb_fx_eur(
 
     # EUR-based names
     out = out.rename(columns={c: f"EUR_{c}" for c in out.columns})
-    
+
     out.loc[:,'EUR_EUR']=1.0
+
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    out.to_pickle(cache)
 
     return out
 
@@ -645,6 +666,86 @@ def mv_frontier_from_dataframes(
 
     return frontier
 
+
+def mv_from_dataframes(
+    cov_df: pd.DataFrame,
+    assumptions: pd.DataFrame,
+    n_points: int = 101,
+):
+    """
+    Compute the MV debt cost-risk frontier with the current composition as row 0.
+
+    Convenience wrapper around `mv_frontier_from_dataframes` that takes a single
+    `assumptions` DataFrame instead of separate series, and prepends the current
+    portfolio composition as the first row of the result.
+
+    Parameters
+    ----------
+    cov_df : pd.DataFrame
+        Covariance matrix of currency returns (assets x assets).
+    assumptions : pd.DataFrame
+        One row per currency. Index must equal `cov_df.index`/`cov_df.columns`.
+        Required columns:
+          - interest_rate          : coupon / yield per currency
+          - expected_appreciation  : expected appreciation of the foreign currency
+                                     vs. the base (positive = base weakens =
+                                     debt becomes more expensive)
+          - min_share              : lower bound on portfolio share
+          - max_share              : upper bound on portfolio share
+          - current_share          : current portfolio composition
+        Expected cost per currency = interest_rate + expected_appreciation.
+    n_points : int
+        Number of points on the frontier (default 101).
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ['risk', 'return', *assets].
+        Row 0 is the current composition (`risk` and `return` evaluated at
+        `current_share`); rows 1..n_points are the frontier sweeping
+        risk-aversion from 0 to 1. `return` is expected debt cost.
+    """
+
+    required = [
+        'interest_rate',
+        'expected_appreciation',
+        'min_share',
+        'max_share',
+        'current_share',
+    ]
+    missing = [c for c in required if c not in assumptions.columns]
+    if missing:
+        raise ValueError(
+            f"assumptions DataFrame is missing required columns: {missing}"
+        )
+
+    if not assumptions.index.equals(cov_df.index):
+        raise ValueError(
+            "assumptions index must match covariance matrix index."
+        )
+
+    expected_cost = assumptions['interest_rate'] + assumptions['expected_appreciation']
+
+    frontier = mv_frontier_from_dataframes(
+        cov_df=cov_df,
+        ret_s=expected_cost,
+        min_s=assumptions['min_share'],
+        max_s=assumptions['max_share'],
+        n_points=n_points,
+    )
+
+    current = assumptions['current_share'].values
+    current_cost = float(current @ expected_cost.values)
+    current_risk = float(np.sqrt(current @ cov_df.values @ current))
+
+    current_row = pd.DataFrame(
+        [[current_risk, current_cost, *current]],
+        columns=frontier.columns,
+    )
+
+    return pd.concat([current_row, frontier], ignore_index=True)
+
+
 # ============================================================
 # Debt cost frontier plotting – FINAL, collision-safe version
 # ============================================================
@@ -675,16 +776,22 @@ def plot_debt_frontier_labeled(
     cov_df: pd.DataFrame | None = None,
     point_min_gap_frac=0.04,
     cmap="tab10",
+    current: pd.Series | None = None,
+    current_label: str = "Current portfolio",
     export_path=None,
     export_formats=("png", "pdf", "svg"),
 ):
     """
     Debt cost frontier with:
-      Panel 1: frontier + standalone currency points
+      Panel 1: frontier + standalone currency points (+ optional current point)
       Panel 2: funding weights (lines + labels)
       Panel 3: funding weights (stacked area + labels)
 
     Designed for cost minimisation (maximize=False).
+
+    If `current` is provided (a Series with at least `risk_col` and `cost_col`
+    entries, e.g. `res.iloc[0]` when `res` came from `mv_from_dataframes`), the
+    current portfolio is drawn on panel 1 as a labelled marker.
     """
 
     if asset_cols is None:
@@ -718,6 +825,15 @@ def plot_debt_frontier_labeled(
             cov_df=cov_df,
             colors=colors,
             min_gap_frac=point_min_gap_frac
+        )
+
+    if current is not None:
+        _annotate_current_point_panel1(
+            ax=axes[0],
+            current=current,
+            risk_col=risk_col,
+            cost_col=cost_col,
+            label=current_label,
         )
 
     # ==================================================
@@ -787,6 +903,7 @@ def plot_debt_frontier_labeled(
 
 def export_figure(fig, path, formats=("png", "pdf"), dpi=300):
     base = Path(path)
+    base.parent.mkdir(parents=True, exist_ok=True)
     for fmt in formats:
         fig.savefig(base.with_suffix(f".{fmt}"), dpi=dpi, bbox_inches="tight")
 
@@ -906,6 +1023,36 @@ def _annotate_area_labels(ax, x, data, colors, min_gap, pos, xpad_frac):
         )
 
 
+def _annotate_current_point_panel1(ax, current, risk_col, cost_col, label):
+    x = float(current[risk_col])
+    y = float(current[cost_col])
+
+    ax.scatter(
+        [x], [y],
+        marker="*",
+        s=260,
+        color="black",
+        edgecolor="white",
+        linewidth=1.2,
+        zorder=5,
+    )
+
+    xmin, xmax = ax.get_xlim()
+    xrng = xmax - xmin if xmax != xmin else 1.0
+
+    ax.annotate(
+        label,
+        xy=(x, y),
+        xytext=(x + xrng * 0.05, y),
+        ha="left",
+        va="center",
+        fontsize=10,
+        fontweight="bold",
+        color="black",
+        arrowprops=dict(arrowstyle="-", lw=1.0, color="black"),
+    )
+
+
 def _annotate_currency_points_panel1(ax, cost_s, cov_df, colors, min_gap_frac):
     assets = cost_s.index
     risk = np.sqrt(np.diag(cov_df.loc[assets, assets].values))
@@ -941,6 +1088,273 @@ def _annotate_currency_points_panel1(ax, cost_s, cov_df, colors, min_gap_frac):
             color=colors[p["c"]],
             arrowprops=dict(arrowstyle="-", lw=0.8, color=colors[p["c"]])
         )
+
+
+# ============================================================
+# Interactive input widget for the debt-cost frontier
+# ============================================================
+
+_FRONTIER_COLS = [
+    'interest_rate',
+    'expected_appreciation',
+    'min_share',
+    'max_share',
+    'current_share',
+]
+
+_FRONTIER_COL_LABELS = {
+    'interest_rate':         'Interest rate',
+    'expected_appreciation': 'Expected FX appr.',
+    'min_share':             'Min share',
+    'max_share':             'Max share',
+    'current_share':         'Current share',
+}
+
+_FRONTIER_COL_STEP = {
+    'interest_rate':         0.001,
+    'expected_appreciation': 0.001,
+    'min_share':             0.05,
+    'max_share':             0.05,
+    'current_share':         0.05,
+}
+
+
+@dataclass
+class DebtFrontierInputs:
+    """User-editable inputs for the debt-cost frontier.
+
+    Wraps a covariance matrix plus the per-currency assumptions DataFrame
+    used by `mv_from_dataframes`. Provides an ipywidgets grid editor and
+    a `plot()` shortcut.
+
+    Parameters
+    ----------
+    cov_df : pd.DataFrame
+        Covariance matrix indexed by currency code (square, matching rows/cols).
+        Treated as read-only — provided once at construction.
+    assumptions : pd.DataFrame
+        One row per currency. Index must cover `cov_df.index`. Required columns:
+        `interest_rate`, `expected_appreciation`, `min_share`, `max_share`,
+        `current_share`. A copy is stored on the instance so the caller's
+        frame is not mutated.
+    n_points : int
+        Frontier resolution forwarded to `mv_from_dataframes`.
+    """
+
+    cov_df: pd.DataFrame
+    assumptions: pd.DataFrame
+    n_points: int = 101
+    name: str = 'basis'
+    chartfolder: str = 'graph/'
+
+    def __post_init__(self):
+        if not self.cov_df.index.equals(self.cov_df.columns):
+            raise ValueError("cov_df must be square with matching index/columns.")
+
+        missing = [c for c in _FRONTIER_COLS if c not in self.assumptions.columns]
+        if missing:
+            raise ValueError(
+                f"assumptions DataFrame is missing required columns: {missing}"
+            )
+
+        if not set(self.cov_df.index).issubset(self.assumptions.index):
+            raise ValueError(
+                "assumptions index must cover every currency in cov_df.index."
+            )
+
+        # store an aligned, editable copy
+        self.assumptions = (
+            self.assumptions.loc[self.cov_df.index, _FRONTIER_COLS].astype(float).copy()
+        )
+
+    # ----- defaults --------------------------------------------------
+    @classmethod
+    def from_cov(
+        cls,
+        cov_df: pd.DataFrame,
+        interest_rate: float = 0.02,
+        expected_appreciation: float = 0.0,
+        min_share: float = 0.0,
+        max_share: float = 1.0,
+        equal_weights: bool = True,
+        n_points: int = 101,
+        name: str = 'basis',
+        chartfolder: str = 'graph/',
+    ):
+        """Build an instance with sensible defaults for every currency."""
+        n = len(cov_df.index)
+        current = (1.0 / n) if equal_weights else 0.0
+
+        assumptions = pd.DataFrame(
+            {
+                'interest_rate':         interest_rate,
+                'expected_appreciation': expected_appreciation,
+                'min_share':             min_share,
+                'max_share':             max_share,
+                'current_share':         current,
+            },
+            index=cov_df.index,
+        )
+        return cls(cov_df=cov_df, assumptions=assumptions, n_points=n_points, name=name, chartfolder=chartfolder)
+
+    # ----- compute ---------------------------------------------------
+    def solve(self):
+        """Run `mv_from_dataframes` against the current assumptions."""
+        return mv_from_dataframes(
+            cov_df=self.cov_df,
+            assumptions=self.assumptions,
+            n_points=self.n_points,
+        )
+
+    def plot(self, **kwargs):
+        """Solve and draw the labelled debt-cost frontier."""
+        res = self.solve()
+        expected_cost = (
+            self.assumptions['interest_rate']
+            + self.assumptions['expected_appreciation']
+        )
+
+        export_path = str(Path(self.chartfolder) / self.name)
+
+        defaults = dict(
+            label_pos="start",
+            cost_col="return",
+            cost_s=expected_cost,
+            cov_df=self.cov_df,
+            current=res.iloc[0],
+            export_path=export_path,
+            export_formats=('svg',),
+        )
+        defaults.update(kwargs)
+
+        plot_debt_frontier_labeled(
+            res.iloc[1:].reset_index(drop=True),
+            **defaults,
+        )
+        return res
+
+    # ----- widget ----------------------------------------------------
+    def widget(self, on_change: Optional[Callable] = None):
+        """Build an ipywidgets grid editor.
+
+        Rows are currencies; columns are the five input fields. Editing a
+        cell writes through to `self.assumptions` immediately. The Run
+        button calls `self.plot()` into an Output area below.
+
+        Parameters
+        ----------
+        on_change : callable, optional
+            Called as `on_change(self)` after every cell edit. Useful for
+            wiring up custom live displays.
+
+        Returns
+        -------
+        ipywidgets.VBox
+            Drop into a notebook cell to render.
+        """
+        import ipywidgets as widgets
+        from IPython.display import clear_output
+
+        ccys = list(self.assumptions.index)
+        cells = {}
+
+        # header row: blank corner + column titles
+        header = [widgets.HTML("")]
+        for col in _FRONTIER_COLS:
+            header.append(
+                widgets.HTML(
+                    f"<div style='text-align:center;font-weight:600'>"
+                    f"{_FRONTIER_COL_LABELS[col]}</div>"
+                )
+            )
+
+        body = []
+        for ccy in ccys:
+            body.append(
+                widgets.HTML(f"<b style='padding-right:6px'>{ccy}</b>")
+            )
+            for col in _FRONTIER_COLS:
+                w = widgets.FloatText(
+                    value=float(self.assumptions.at[ccy, col]),
+                    step=_FRONTIER_COL_STEP[col],
+                    layout=widgets.Layout(width='110px'),
+                )
+                cells[(ccy, col)] = w
+                body.append(w)
+
+        grid = widgets.GridBox(
+            children=header + body,
+            layout=widgets.Layout(
+                grid_template_columns='80px ' + 'repeat({}, 120px)'.format(
+                    len(_FRONTIER_COLS)
+                ),
+                grid_gap='4px 8px',
+                align_items='center',
+            ),
+        )
+
+        name_box = widgets.Text(
+            value=self.name,
+            description='Name:',
+            layout=widgets.Layout(width='260px'),
+        )
+
+        sum_label = widgets.HTML()
+        run_btn = widgets.Button(
+            description='Run frontier',
+            button_style='primary',
+            icon='play',
+        )
+        out = widgets.Output()
+
+        def refresh_sum():
+            s = float(self.assumptions['current_share'].sum())
+            ok = abs(s - 1.0) < 1e-6
+            color = '#1a7f37' if ok else '#b42318'
+            sum_label.value = (
+                f"<span style='color:{color};margin-left:12px'>"
+                f"Σ current_share = {s:.4f}</span>"
+            )
+
+        def on_name_change(change):
+            self.name = change['new']
+
+        def on_cell_change(change, ccy, col):
+            self.assumptions.at[ccy, col] = float(change['new'])
+            if col == 'current_share':
+                refresh_sum()
+            if on_change is not None:
+                on_change(self)
+
+        name_box.observe(on_name_change, names='value')
+
+        for (ccy, col), w in cells.items():
+            w.observe(
+                lambda change, ccy=ccy, col=col: on_cell_change(change, ccy, col),
+                names='value',
+            )
+
+        def on_run(_):
+            with out:
+                clear_output(wait=True)
+                self.plot()
+
+        run_btn.on_click(on_run)
+        refresh_sum()
+
+        return widgets.VBox([
+            widgets.HTML(
+                "<h3 style='margin:4px 0'>Debt-cost frontier inputs</h3>"
+                "<div style='color:#555;margin-bottom:6px'>"
+                "Edit any cell, then press <b>Run frontier</b>. "
+                f"Chart saved to <code>{self.chartfolder}&lt;name&gt;.svg</code>."
+                "</div>"
+            ),
+            name_box,
+            grid,
+            widgets.HBox([run_btn, sum_label]),
+            out,
+        ])
 
 
 if __name__ == '__main__':
@@ -985,30 +1399,34 @@ if __name__ == '__main__':
         )
     #%%
     cov_df = fx_cov.rename(
-    index=lambda x: x.split('_')[1],
-    columns=lambda x: x.split('_')[1]
-     )
-    names =cov_df.index 
+        index=lambda x: x.split('_')[1],
+        columns=lambda x: x.split('_')[1],
+    )
+    names = cov_df.index
 
-    fx_yield = pd.Series([0.01,0.02,0.023,0.013,0.034],index = names)
-    risk_i = pd.DataFrame(np.sqrt(np.diag(fx_cov.values)),index=fx_yield.index)
+    assumptions = pd.DataFrame(
+        {
+            'interest_rate':         [0.010, 0.020, 0.023, 0.013, 0.034],
+            'expected_appreciation': [0.000, 0.000, 0.000, 0.000, 0.000],
+            'min_share':             [0.0, 0.0, 0.0, 0.0, 0.0],
+            'max_share':             [1.0, 1.0, 1.0, 1.0, 1.0],
+            'current_share':         [0.2, 0.2, 0.2, 0.2, 0.2],
+        },
+        index=names,
+    )
 
-    risk_return = pd.concat([fx_yield,risk_i],axis=1)
-    risk_return.columns= ['Yield','risk']
-    min_s =  pd.Series(0.0,index = names)
-    max_s =  pd.Series(1.0,index = names)
-    
-    res = mv_frontier_from_dataframes(cov_df=cov_df,ret_s=fx_yield,
-               min_s=min_s,max_s=max_s)                       
-    
- 
+    res = mv_from_dataframes(cov_df=cov_df, assumptions=assumptions)
+
+    expected_cost = assumptions['interest_rate'] + assumptions['expected_appreciation']
+
     plot_debt_frontier_labeled(
-        res,
+        res.iloc[1:].reset_index(drop=True),
         label_pos="start",
         cost_col="return",
-        cost_s=fx_yield,
+        cost_s=expected_cost,
         cov_df=cov_df,
+        current=res.iloc[0],
         export_path="zar_debt_frontier",
-        export_formats=("png", "pdf", "svg")
+        export_formats=("png", "pdf", "svg"),
     )
 
