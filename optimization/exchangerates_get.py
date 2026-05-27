@@ -308,20 +308,53 @@ def get_fx_returns(
 def get_fx_covariance(
     returns,
     allow_missing=False,
-    correlation=False
+    correlation=False,
+    periods_per_year=None,
 ):
     """
     Compute covariance (and optionally correlation) from FX returns.
 
+    Annualisation
+    -------------
+    FX return volatility is typically quoted on an **annual** basis, while the
+    interest rates fed into the MV optimiser are also annual.  For the risk axis
+    of the frontier to be in the same units as the cost axis, the covariance
+    matrix must be annualised before optimisation.
+
+    The scaling rule is:
+
+        annual_cov  = periods_per_year  × quarterly_cov
+        annual_std  = √periods_per_year × quarterly_std
+
+    For quarterly data  ``periods_per_year=4``  →  ``annual_std = 2 × quarterly_std``.
+    For monthly data    ``periods_per_year=12`` →  ``annual_std = √12 × monthly_std``.
+
+    Pass ``periods_per_year=None`` (the default) to skip scaling and return the
+    raw at-frequency covariance — this preserves the old behaviour for callers
+    that do their own scaling or do not need annual units.
+
     Parameters
     ----------
     returns : pd.DataFrame
-        FX returns at native frequency
+        FX returns at native frequency.
     allow_missing : bool
-        If False, raise error on missing data
-        If True, drop rows with any missing values
+        If False (default), raise a detailed error on any missing return.
+        If True, drop rows that contain any NaN before computing.
     correlation : bool
-        If True, also return correlation matrix
+        If True, return the correlation matrix instead of the covariance matrix.
+        Annualisation does not affect correlation; ``periods_per_year`` is
+        ignored when ``correlation=True``.
+    periods_per_year : int or None
+        Number of return periods in one year.  Used to annualise the covariance:
+        ``cov_annual = periods_per_year * cov_native``.
+        Common values: 4 (quarterly), 12 (monthly), 252 (daily).
+        ``None`` → no scaling (default, backward-compatible).
+
+    Returns
+    -------
+    pd.DataFrame
+        Covariance (or correlation) matrix.  If ``periods_per_year`` is
+        provided the covariance is in annual units.
     """
 
     r = returns.copy()
@@ -353,13 +386,17 @@ def get_fx_covariance(
         # explicit policy if missing allowed
         r = r.dropna(how="any")
 
+    if correlation:
+        return r.corr()
+
     cov = r.cov()
 
-    if not correlation:
-        return cov
+    if periods_per_year is not None:
+        cov = cov * periods_per_year   # annual_cov = T * quarterly_cov
+                                       # annual_std = √T * quarterly_std
+                                       # for T=4: annual_std = 2 * quarterly_std
 
-    corr = r.corr()
-    return corr
+    return cov
 
 
 
