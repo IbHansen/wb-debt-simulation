@@ -174,6 +174,120 @@ def convert_base_currency(
 
 
 
+def fx_from_xlsx(
+    path=None,
+    freq="Q",
+    agg="mean",
+    base="ZAR",
+):
+    """
+    Load daily FX rates from an Excel file and resample to a chosen frequency.
+
+    Expected Excel layout: one **Date** column (datetime-parseable) and one or
+    more rate columns named ``{QUOTE}{BASE}`` or ``{BASE}{QUOTE}`` (e.g.
+    ``'CHFZAR'``, ``'USDZAR '``). Trailing/leading whitespace in column names is
+    stripped automatically.
+
+    The function:
+
+    1. Strips whitespace from column names.
+    2. Detects columns whose names end in ``{BASE}`` (e.g. ``'…ZAR'``).
+    3. Renames them to ``{BASE}_{QUOTE}`` (e.g. ``'ZAR_CHF'``).
+    4. **Inverts** the values so each column represents *units of quote per one
+       unit of base* — the same convention produced by
+       ``ecb_fx_eur`` + ``convert_base_currency``.
+       Example: CHFZAR = 15.30 → ZAR_CHF = 1/15.30 ≈ 0.065.
+    5. Columns already in ``{BASE}{QUOTE}`` form (base as prefix) are renamed
+       to ``{BASE}_{QUOTE}`` without inversion.
+    6. Resamples from daily to the requested *freq* using *agg*.
+    7. Returns a ``pd.PeriodIndex`` DataFrame, plug-in compatible with
+       ``get_fx_returns`` / ``get_fx_covariance`` / ``mv_from_dataframes``.
+
+    Parameters
+    ----------
+    path : str or Path, optional
+        Excel file to read. Defaults to
+        ``<this_file_parent>/currency/FX Data.xlsx``.
+    freq : str
+        Output frequency: ``'D'`` (daily), ``'M'`` (monthly), ``'Q'``
+        (quarterly), ``'Y'`` (annual). Default ``'Q'``.
+    agg : str
+        Aggregation used when resampling: ``'mean'`` (default), ``'last'``,
+        ``'first'``.
+    base : str
+        Base currency code that appears as a suffix in the raw column names.
+        Default ``'ZAR'``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns named ``{BASE}_{QUOTE}`` (e.g. ``'ZAR_CHF'``, ``'ZAR_USD'``),
+        values = units of quote per 1 base unit.
+        Index: ``pd.PeriodIndex`` at the requested frequency.
+
+    Examples
+    --------
+    >>> import exchangerates_get as er
+    >>> fx_q = er.fx_from_xlsx(freq='Q', agg='mean')   # quarterly means
+    >>> fx_returns = er.get_fx_returns(fx_q)
+    >>> fx_cov = er.get_fx_covariance(fx_returns)
+    """
+    if path is None:
+        path = Path(__file__).parent / "currency" / "FX Data.xlsx"
+
+    df = pd.read_excel(path)
+
+    # 1. strip whitespace from column names
+    df.columns = df.columns.str.strip()
+
+    # 2. ensure Date column is datetime and use it as the index
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.set_index("Date").sort_index()
+
+    # 3. detect, rename and (where needed) invert columns
+    base_up = base.upper()
+    rename_map = {}
+    invert_cols = []  # columns to invert (XXXZAR -> ZAR_XXX)
+
+    for col in df.columns:
+        up = col.upper()
+        if up.endswith(base_up):
+            # e.g. 'CHFZAR' → quote='CHF', new='ZAR_CHF', must invert
+            quote = up[: -len(base_up)]
+            new_name = f"{base_up}_{quote}"
+            rename_map[col] = new_name
+            invert_cols.append(new_name)
+        elif up.startswith(base_up):
+            # e.g. 'ZARUSD' → quote='USD', new='ZAR_USD', already correct units
+            quote = up[len(base_up):]
+            rename_map[col] = f"{base_up}_{quote}"
+        # else: leave unchanged (non-rate columns, if any)
+
+    df = df.rename(columns=rename_map)
+
+    # 4. invert XXXBASE columns: CHFZAR=15.30 → ZAR_CHF = 1/15.30 ≈ 0.065
+    for col in invert_cols:
+        df[col] = 1.0 / df[col]
+
+    # 5. resample from daily
+    if freq == "D":
+        out = df
+    else:
+        if agg == "mean":
+            out = df.resample(freq).mean()
+        elif agg == "last":
+            out = df.resample(freq).last()
+        elif agg == "first":
+            out = df.resample(freq).first()
+        else:
+            raise ValueError(f"agg must be 'mean', 'last', or 'first'; got {agg!r}")
+
+    # 6. convert to PeriodIndex (macro-friendly, consistent with ecb_fx_eur)
+    out.index = out.index.to_period(freq)
+
+    return out
+
+
 def get_fx_returns(
     fx,
     log_returns=True
